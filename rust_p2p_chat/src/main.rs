@@ -134,6 +134,7 @@ impl rustls::client::danger::ServerCertVerifier for NoopServerCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        // すべての一般的な署名スキームをサポート
         vec![
             rustls::SignatureScheme::RSA_PKCS1_SHA1,
             rustls::SignatureScheme::ECDSA_SHA1_Legacy,
@@ -232,6 +233,11 @@ where
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Rustlsの暗号化プロバイダーを初期化
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| "暗号化プロバイダーの初期化に失敗しました")?;
+
     let cli = Cli::parse();
 
     match &cli.command {
