@@ -3,7 +3,7 @@ use futures_util::{stream::StreamExt, SinkExt};
 use rcgen::generate_simple_self_signed;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{stdin, AsyncBufReadExt};
+use tokio::io::{stdin, AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::{self, pki_types::CertificateDer, ClientConfig, ServerConfig};
 use tokio_rustls::TlsConnector;
@@ -25,7 +25,7 @@ enum Commands {
     },
     /// 指定したサーバーにクライアントとして接続します
     Connect {
-        #[arg(help = "接続先のサーバーアドレス (例: wss://123.45.67.89:8080)")]
+        #[arg(help = "接続先のサーバーアドレス (例: wss://127.0.0.1:8080)")]
         uri: String,
     },
 }
@@ -43,7 +43,7 @@ async fn run_server(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> 
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()]; // WebSocketはHTTP/1.1上でハンドシェイク
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
 
     // 3. TCPリスナーの起動
@@ -71,7 +71,6 @@ async fn run_client(uri: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. TLSクライアント設定（サーバー証明書を検証しない）
     let root_cert_store = rustls::RootCertStore::empty();
-    // config変数を可変にする
     let mut config = ClientConfig::builder()
         .with_root_certificates(root_cert_store)
         .with_no_client_auth();
@@ -83,14 +82,16 @@ async fn run_client(uri: &str) -> Result<(), Box<dyn std::error::Error>> {
     let connector = TlsConnector::from(Arc::new(config));
     let url = url::Url::parse(uri)?;
     let host = url.host_str().ok_or("URIにホスト名がありません")?;
+    let port = url.port().unwrap_or(8080);
 
     // 2. TCP接続とTLSハンドシェイク
-    let stream = TcpStream::connect(url.socket_addrs(|| Some(8080))?[0]).await?;
+    let addr = format!("{}:{}", host, port);
+    let stream = TcpStream::connect(&addr).await?;
     let domain = rustls::pki_types::ServerName::try_from(host)?.to_owned();
     let tls_stream = connector.connect(domain, stream).await?;
 
     // 3. WebSocketハンドシェイク
-    let ws_stream = tokio_tungstenite::client_async(uri, tls_stream).await?;
+    let (ws_stream, _) = tokio_tungstenite::client_async(uri, tls_stream).await?;
     println!("WebSocket接続が確立しました。");
 
     handle_connection(ws_stream).await;
@@ -115,11 +116,11 @@ impl rustls::client::danger::ServerCertVerifier for NoopServerCertVerifier {
     }
 
     fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -133,10 +134,23 @@ impl rustls::client::danger::ServerCertVerifier for NoopServerCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::ALL_SUPPORTED_SCHEMES.to_vec()
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA1,
+            rustls::SignatureScheme::ECDSA_SHA1_Legacy,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ED448,
+        ]
     }
 }
-
 
 // 接続後のメッセージ送受信をハンドルする共通関数
 async fn handle_connection<S>(ws_stream: tokio_tungstenite::WebSocketStream<S>)
@@ -145,35 +159,75 @@ where
 {
     println!("チャットを開始します。メッセージを入力してEnterキーを押してください。");
 
-    let mut stdin = tokio::io::BufReader::new(stdin()).lines();
+    // WebSocketストリームを送信と受信に分割
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let mut stdin = BufReader::new(stdin()).lines();
 
     loop {
         tokio::select! {
             // 標準入力からメッセージを読み取って送信
-            Ok(Some(line)) = stdin.next_line() => {
-                if ws_stream.send(tokio_tungstenite::tungstenite::Message::Text(line)).await.is_err() {
-                    println!("接続が切れました。");
-                    break;
+            line_result = stdin.next_line() => {
+                match line_result {
+                    Ok(Some(line)) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        if let Err(e) = ws_sender.send(tokio_tungstenite::tungstenite::Message::Text(line)).await {
+                            println!("メッセージ送信エラー: {}", e);
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        println!("標準入力が閉じられました。");
+                        break;
+                    }
+                    Err(e) => {
+                        println!("標準入力読み取りエラー: {}", e);
+                        break;
+                    }
                 }
             }
             // WebSocketからメッセージを受信して表示
-            Some(Ok(msg)) = ws_stream.next() => {
-                match msg {
-                    tokio_tungstenite::tungstenite::Message::Text(text) => {
-                        println!("相手: {}", text);
+            msg_result = ws_receiver.next() => {
+                match msg_result {
+                    Some(Ok(msg)) => {
+                        match msg {
+                            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                                println!("相手: {}", text);
+                            }
+                            tokio_tungstenite::tungstenite::Message::Close(close_frame) => {
+                                if let Some(frame) = close_frame {
+                                    println!("相手が接続を切断しました: {} - {}", frame.code, frame.reason);
+                                } else {
+                                    println!("相手が接続を切断しました。");
+                                }
+                                break;
+                            }
+                            tokio_tungstenite::tungstenite::Message::Ping(data) => {
+                                if let Err(e) = ws_sender.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await {
+                                    println!("Pong送信エラー: {}", e);
+                                    break;
+                                }
+                            }
+                            _ => {
+                                // その他のメッセージタイプは無視
+                            }
+                        }
                     }
-                    tokio_tungstenite::tungstenite::Message::Close(_) => {
-                        println!("相手が接続を切断しました。");
+                    Some(Err(e)) => {
+                        println!("WebSocketエラー: {}", e);
                         break;
                     }
-                    _ => {}
+                    None => {
+                        println!("WebSocket接続が閉じられました。");
+                        break;
+                    }
                 }
-            }
-            else => {
-                break;
             }
         }
     }
+
+    println!("チャット終了。");
 }
 
 #[tokio::main]
@@ -182,10 +236,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match &cli.command {
         Commands::Listen { addr } => {
-            run_server(*addr).await?;
+            if let Err(e) = run_server(*addr).await {
+                eprintln!("サーバーエラー: {}", e);
+                std::process::exit(1);
+            }
         }
         Commands::Connect { uri } => {
-            run_client(uri).await?;
+            if let Err(e) = run_client(uri).await {
+                eprintln!("クライアントエラー: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 
