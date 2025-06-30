@@ -30,9 +30,74 @@ enum Commands {
     },
 }
 
+// グローバルIPアドレスを取得する関数
+async fn get_global_ip() -> Result<String, Box<dyn std::error::Error>> {
+    // 複数のサービスを試行して、より確実にIPを取得
+    let services = [
+        "https://api.ipify.org",
+        "https://httpbin.org/ip",
+        "https://icanhazip.com",
+    ];
+
+    for service in &services {
+        match try_get_ip_from_service(service).await {
+            Ok(ip) => return Ok(ip),
+            Err(e) => {
+                eprintln!("{}からのIP取得に失敗: {}", service, e);
+                continue;
+            }
+        }
+    }
+
+    Err("すべてのIPサービスからの取得に失敗しました".into())
+}
+
+async fn try_get_ip_from_service(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    
+    let response = client.get(url).send().await?;
+    let text = response.text().await?;
+    
+    // サービスによってレスポンス形式が異なるため、IPアドレスを抽出
+    let ip = if url.contains("httpbin.org") {
+        // httpbin.orgはJSON形式: {"origin": "x.x.x.x"}
+        let json: serde_json::Value = serde_json::from_str(&text)?;
+        json["origin"].as_str().unwrap_or("").to_string()
+    } else {
+        // その他のサービスはプレーンテキスト
+        text.trim().to_string()
+    };
+    
+    // IPアドレスの簡単な検証
+    if ip.is_empty() || !ip.chars().any(|c| c.is_ascii_digit()) {
+        return Err("無効なIPアドレス形式".into());
+    }
+    
+    Ok(ip)
+}
+
 // サーバー側の処理
 async fn run_server(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     println!("サーバーを起動します: {}", addr);
+    
+    // グローバルIPアドレスを取得して表示
+    println!("グローバルIPアドレスを取得中...");
+    match get_global_ip().await {
+        Ok(global_ip) => {
+            println!("グローバルIPアドレス: {}", global_ip);
+            let port = addr.port();
+            if addr.ip().is_loopback() {
+                println!("外部からの接続用URL: wss://{}:{}", global_ip, port);
+                println!("注意: ファイアウォールでポート{}が開放されている必要があります", port);
+            }
+        }
+        Err(e) => {
+            eprintln!("グローバルIPアドレスの取得に失敗しました: {}", e);
+            println!("ローカルアドレスでのみ接続を受け付けます");
+        }
+    }
 
     // 1. 自己署名証明書の生成
     let cert = generate_simple_self_signed(vec!["localhost".into()])?;
