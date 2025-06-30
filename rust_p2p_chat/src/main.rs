@@ -78,9 +78,26 @@ async fn try_get_ip_from_service(url: &str) -> Result<String, Box<dyn std::error
     Ok(ip)
 }
 
+// ローカルIPアドレスを取得する関数
+async fn get_local_ip() -> Result<String, Box<dyn std::error::Error>> {
+    use std::net::UdpSocket;
+    
+    // ダミーの外部アドレスに接続して、使用されるローカルIPを取得
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:80")?;
+    let local_addr = socket.local_addr()?;
+    Ok(local_addr.ip().to_string())
+}
+
 // サーバー側の処理
 async fn run_server(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     println!("サーバーを起動します: {}", addr);
+    
+    // ローカルIPアドレスを取得して表示
+    if let Ok(local_ip) = get_local_ip().await {
+        println!("ローカルIPアドレス: {}", local_ip);
+        println!("ローカルネットワーク内からの接続用URL: wss://{}:{}", local_ip, addr.port());
+    }
     
     // グローバルIPアドレスを取得して表示
     println!("グローバルIPアドレスを取得中...");
@@ -88,10 +105,12 @@ async fn run_server(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> 
         Ok(global_ip) => {
             println!("グローバルIPアドレス: {}", global_ip);
             let port = addr.port();
-            if addr.ip().is_loopback() {
-                println!("外部からの接続用URL: wss://{}:{}", global_ip, port);
-                println!("注意: ファイアウォールでポート{}が開放されている必要があります", port);
-            }
+            println!("外部からの接続用URL: wss://{}:{}", global_ip, port);
+            println!("注意: 以下の設定が必要です:");
+            println!("  1. Windowsファイアウォールでポート{}を開放", port);
+            println!("  2. ルーターでポートフォワーディング設定 (外部{}→内部{}:{})", port, 
+                    get_local_ip().await.unwrap_or_else(|_| "LOCAL_IP".to_string()), port);
+            println!("  3. ISPがポート{}をブロックしていないことを確認", port);
         }
         Err(e) => {
             eprintln!("グローバルIPアドレスの取得に失敗しました: {}", e);
